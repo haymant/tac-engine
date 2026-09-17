@@ -1,0 +1,81 @@
+name: Publish tac-engine binary
+
+on:
+  push:
+    tags:
+      - "tac-engine-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  BINARY_NAME: tac-engine-linux-x86_64-gnu
+
+jobs:
+  build-linux-x86_64:
+    name: Build manylinux x86_64 binary
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - name: Checkout tac-engine
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-manylinux2_28-tac-engine-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-manylinux2_28-tac-engine-
+
+      - name: Build release binary
+        shell: bash
+        working-directory: ./
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --locked --release
+          strip target/release/tac-engine
+          test -x target/release/tac-engine
+
+      - name: Package binary and checksum
+        shell: bash
+        working-directory: ./
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp target/release/tac-engine dist/package/tac-engine
+          cp LICENSE* dist/package/ 2>/dev/null || true
+          cp README.md dist/package/ 2>/dev/null || true
+          tar -C dist/package -czf "dist/${BINARY_NAME}.tar.gz" .
+          sha256sum "dist/${BINARY_NAME}.tar.gz" | tee "dist/${BINARY_NAME}.tar.gz.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: dist/*
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ env.BINARY_NAME }}.tar.gz
+            dist/${{ env.BINARY_NAME }}.tar.gz.sha256
+          generate_release_notes: true
