@@ -99,6 +99,10 @@ Watchlists / positions / orders: `list_*`, `get_*`, `create_*`, `place_order`, `
 | `get_forex_latest_rates` | required `currency_pairs` e.g. `USDJPY,EURUSD` |
 | `get_forex_rates` | historical; optional `timeframe`, `start`, `end` |
 
+Latest rates give spot/forwards; the daily closes feed the realized
+**`fx_vol_surface`** (`tac-engine/skills/tac-market-data/SKILL.md`) used when the
+payment currency is not USD.
+
 ### Stocks
 
 | Tool | Notes |
@@ -122,6 +126,11 @@ Multi-symbol tools take comma-separated `symbols`. Optional `feed` (`iex`/`sip`)
 | `get_option_snapshots` | contracts |
 | `get_option_chain` | underlying + filters (`type`, strikes, expiration) |
 | `get_option_meta_conditions` / `get_option_meta_exchanges` | code maps |
+
+`get_option_chain` returns per-contract `iv` and `delta` (indicative feed) — the raw
+input for implied-vol-surface calibration. The **`vol_surface`** tool
+(`tac-engine/skills/tac-market-data/SKILL.md`) consumes it, fits SVI/eSSVI, caches the
+grid in the lake, and returns the `market_data.vol_surfaces` block for pricing.
 
 ### Realtime stream sampling
 

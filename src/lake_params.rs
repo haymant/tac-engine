@@ -342,6 +342,48 @@ pub struct CorrMatrixParams {
     pub alpha: Option<f64>,
 }
 
+/// Calibrated implied-vol surface for one underlying from the live option chain.
+///
+/// Serves a cached calibration (`vol_surfaces/<SYMBOL>.json`) when it is younger
+/// than `max_age_secs` (default 600 = 10 minutes); otherwise fetches the chain,
+/// fits SVI per expiry, persists and returns the fina-risk `vol_surfaces` block.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct VolSurfaceParams {
+    /// Underlying ticker, e.g. `ADBE` (bare, not the market-qualified id).
+    pub underlying: String,
+    /// Evaluation date as an Excel serial; defaults to today.
+    pub evaluation_date: Option<i64>,
+    /// Reference spot for the strike grid; defaults to the median chain strike.
+    pub reference: Option<f64>,
+    /// Freshness window in seconds (default 600).
+    pub max_age_secs: Option<i64>,
+    /// Force recalibration, ignoring the cache.
+    pub refresh: Option<bool>,
+    /// Number of grid strikes (default 21, clamped 5..=41).
+    pub grid_points: Option<usize>,
+    /// Deal expiry (Excel serial). Restricts calibration to expiries within
+    /// ±`tenor_window_days` of it, so short-dated weeklies don't distort the
+    /// term structure of a longer deal.
+    pub deal_expiry: Option<i64>,
+    /// Half-window around `deal_expiry` in days (default 200).
+    pub tenor_window_days: Option<i64>,
+}
+
+/// Force-recalibrate (ignore the cache) or inspect a cached surface.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct VolSurfaceStatusParams {
+    /// Underlying ticker.
+    pub underlying: String,
+    /// Recalibrate even when the cache is fresh.
+    pub refresh: Option<bool>,
+    /// Evaluation date as an Excel serial; defaults to today.
+    pub evaluation_date: Option<i64>,
+    /// Reference spot override.
+    pub reference: Option<f64>,
+    /// Grid strike count.
+    pub grid_points: Option<usize>,
+}
+
 /// Large-scale benchmark: build N stock legs (real lake symbols + synthetic
 /// `AAPL1..N`-style clones when the lake is thin) × the FX universe, compute
 /// the full Kendall correlation matrix with dampening, and write ~N²/2 pair

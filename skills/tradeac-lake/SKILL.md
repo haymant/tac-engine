@@ -84,12 +84,31 @@ The tac-engine MCP server exposes a **lake tools** category that wraps the read/
 | `load_lake_status` | Query the status of a background bulk-load job: `{job_id}`. Returns `{job_id, status, total_symbols, processed, results, error, started_at, completed_at}` where `status` is `running`, `completed`, or `failed`, and `results` contains per-symbol bar counts, TA/SP column counts, and any errors. |
 | `backfill_lake_calendar` | **Gap-fill tool**: seed/enrich `calendar.parquet` from Alpaca historical auctions (feed=iex; records exist only on trading days): `{market?, symbols, start?, end?}`. Returns `{market, symbols, start, end, calendar_days_added}`. Call this before lazy bar loads so the `1d` completeness check knows the expected trading-day set. |
 | `validate_lake_dataset` | **Pre-workflow quality gate**: `{market?, timeframe?, symbols?, start?, end?}`. Scans every symbol in coverage (or a comma-separated `symbols` subset) and reports `verdict: OK/WARNINGS/ERRORS` plus per-symbol issues. Catches the failure modes qlib silently tolerates: **all-NaN feature columns** (would be dropped by `DropAllNaN` — the model trains on fewer features without notice), **missing TA/SP feature files**, **hollow coverage / stale date ranges** (coverage claims a wide span but the bar file is empty/truncated/sparse), **stale coverage** (first/last/num_bars vs the actual file), and **partition misalignment** (flat-layout feature orphans the family=ta|sp consumers can't see). Pass `start`/`end` to also check feature-vs-bar row alignment and per-column all-NaN status in that window. Call before `rd_run_workflow` / `rd_train` to fail fast instead of training on silent data holes. |
+| `corr_calc` | Kendall τ-b (dampened) between **two** legs over a trailing daily-return window: `{leg_a, leg_b, window_days?, alpha?}`. Legs resolve by name — a 6-letter token is an FX pair (`market=FX`), anything else is a US-lake equity; both are pulled from the lake. Returns `rho0` and `rho=(rho0+alpha)/(1+alpha)`. |
+| `corr_matrix` | Full Kendall τ-b matrix (dampened) over a comma-separated leg list: `{legs, window_days?, alpha?}`. Same leg resolution as `corr_calc`. Primary source for a worst-of basket's `market_data.correlations`. |
+| `vol_surface` | **Spec (pending):** calibrated implied-vol surface for a symbol (SVI per expiry / eSSVI across expiries) with a **10-minute lake cache**: `{underlying, as_of?, max_age_secs=600, model="essvi"}`. Reads `$TAC_LAKE_DIR/vol_surfaces.parquet` when fresh, else fetches `get_option_chain`, calibrates, persists, returns the fina-risk `vol_surfaces` block. |
+| `vol_surface_calibrate` | **Spec (pending):** force recalibrate + persist a symbol's surface: `{underlying, model?}`. |
+| `rate_curve` | **Spec (pending):** bootstrap FRED tenor rates into a discount/projection curve: `{currency, as_of?, max_age_secs=600, day_count="ACT/365"}` → `market_data.curves[0]`. Backed by `tac-lake-macro` symbols. |
+| `fx_vol_surface` | **Spec (pending):** realized/implied FX vol grid for a pair: `{pair, as_of?, max_age_secs=600}`. |
 
 Example:
 ```json
 {"symbols": "AAPL,MSFT", "timeframe": "1d", "start": "2026-06-06", "lazy": true}
 ```
 → `{"request": {...}, "source": {"AAPL": "fetched", "MSFT": "lake"}, "bars": {"AAPL": [{...}], "MSFT": [{...}]}}`
+
+## Derived market data (correlation, vol surface, curves, FX)
+
+Beyond raw bars, the lake backs **calibrated market data** for pricing and
+research. Correlation is live (`corr_matrix`); the vol-surface, rate-curve and
+FX-vol tools are specified there with their lake stores and a 10-minute cache.
+See **`tac-engine/skills/tac-market-data/SKILL.md`** for the full contracts and the
+mapping onto a fina-risk `pricing-request` `market_data` block.
+
+- `corr_matrix` / `corr_calc` — Kendall τ-b (dampened) over lake closes → `market_data.correlations`.
+- `vol_surface` (spec) — SVI/eSSVI surface from `get_option_chain`, cached in `vol_surfaces.parquet` → `market_data.vol_surfaces`.
+- `rate_curve` (spec) — FRED tenors (`tac-lake-macro`) → `market_data.curves`.
+- `fx_vol_surface` (spec) — realized/implied FX vol → FX factor.
 
 ## Quiet mode
 

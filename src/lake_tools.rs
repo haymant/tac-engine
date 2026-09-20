@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Duration, Utc};
@@ -21,9 +21,11 @@ use crate::lake_params::{
     LakeRebuildParams, LakeSPParams, LakeStatusParams, LakeSymbolsParams, LakeTAParams,
     LakeValidateParams, LakeWatchlistParams, LoadLakeFxParams, MacroBarsParams,
     MacroBulkLoadParams, MacroFeaturesParams, MacroPutSymbolParams, MacroSymbolsParams,
+    VolSurfaceParams, VolSurfaceStatusParams,
 };
 use crate::macro_sources::{CatalogRow, MacroFetcher};
 use crate::server::TradeacServer;
+use crate::vol;
 
 // ---------------------------------------------------------------------------
 // Background load job state
@@ -230,6 +232,86 @@ fn augment_col(base: &[Option<f64>], seed: u64, variant: u64) -> Vec<Option<f64>
             None => None,
         })
         .collect()
+}
+
+/// Excel serial (ACT/365 days since 1899-12-30) for a calendar date.
+fn excel_serial_date(date: chrono::NaiveDate) -> i64 {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 30).expect("epoch date");
+    (date - epoch).num_days()
+}
+
+/// Parse an OCC option symbol `ROOT YYMMDD C/P STRIKE(8 digits, *1000)`.
+fn parse_occ(symbol: &str) -> Option<(i64, bool, f64)> {
+    if symbol.len() < 16 {
+        return None;
+    }
+    let tail = &symbol[symbol.len() - 15..];
+    let year: i32 = 2000 + tail.get(0..2)?.parse::<i32>().ok()?;
+    let month: u32 = tail.get(2..4)?.parse::<u32>().ok()?;
+    let day: u32 = tail.get(4..6)?.parse::<u32>().ok()?;
+    let is_call = match tail.get(6..7)? {
+        "C" => true,
+        "P" => false,
+        _ => return None,
+    };
+    let strike = tail.get(7..15)?.parse::<i64>().ok()? as f64 / 1000.0;
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    Some((excel_serial_date(date), is_call, strike))
+}
+
+/// Build the fina-risk `vol_surfaces` block from a calibrated surface.
+fn vol_surface_block(
+    symbol: &str,
+    reference: f64,
+    eval_serial: i64,
+    deal_expiry: i64,
+    surface: &vol::VolSurface,
+    grid_points: usize,
+    n_obs: usize,
+) -> Value {
+    let points = grid_points.clamp(5, 41);
+    let mut strikes: Vec<f64> = Vec::with_capacity(points);
+    for index in 0..points {
+        let moneyness = 0.6 + 0.8 * (index as f64) / ((points - 1) as f64);
+        strikes.push((reference * moneyness * 10_000.0).round() / 10_000.0);
+    }
+    let maturities_t: Vec<f64> = surface.slices.iter().map(|slice| slice.t).collect();
+    let maturities: Vec<i64> = maturities_t
+        .iter()
+        .map(|t| eval_serial + (t * 365.0).round() as i64)
+        .collect();
+    let grid = surface.vol_grid(&strikes, &maturities_t);
+    let volatility: Vec<Vec<f64>> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| (value.clamp(0.03, 0.9) * 10_000.0).round() / 10_000.0)
+                .collect()
+        })
+        .collect();
+    let params: Vec<Value> = surface
+        .slices
+        .iter()
+        .map(|slice| {
+            json!({"t": slice.t, "a": slice.svi.a, "b": slice.svi.b, "rho": slice.svi.rho, "m": slice.svi.m, "sigma": slice.svi.sigma})
+        })
+        .collect();
+    json!({
+        "underlying": symbol,
+        "strike_type": "absolute",
+        "reference": reference,
+        "maturities": maturities,
+        "strikes": strikes,
+        "volatility": volatility,
+        "model": "svi",
+        "params": params,
+        "calibrated_at": Utc::now().to_rfc3339(),
+        "calibrated_at_epoch": Utc::now().timestamp(),
+        "deal_expiry": deal_expiry,
+        "n_obs": n_obs,
+        "source": "alpaca",
+        "arbitrage": surface.arbitrage_violations(),
+    })
 }
 
 #[tool_router(router = lake_tools, vis = "pub")]
@@ -1233,6 +1315,184 @@ impl TradeacServer {
             "end": resp_end,
             "note": "load running in background -- poll load_lake_status with this job_id to track progress",
         })))
+    }
+
+    #[tool(
+        description = "Calibrated implied-vol surface (SVI per expiry, interpolated in total variance) for an underlying, from the live option chain. Serves vol_surfaces/<SYM>.json when younger than max_age_secs (default 600), else recalibrates, persists and returns the fina-risk vol_surfaces block."
+    )]
+    async fn vol_surface(
+        &self,
+        Parameters(params): Parameters<VolSurfaceParams>,
+    ) -> Result<String, McpError> {
+        let symbol = params.underlying.trim().to_uppercase();
+        if symbol.is_empty() {
+            return Err(McpError::invalid_params("underlying is required", None));
+        }
+        let eval_serial = params
+            .evaluation_date
+            .unwrap_or_else(|| excel_serial_date(Utc::now().date_naive()));
+        let mut reference = params.reference.unwrap_or(0.0);
+        let max_age = params.max_age_secs.unwrap_or(600).max(0);
+        let grid_points = params.grid_points.unwrap_or(21);
+        let deal_expiry = params.deal_expiry.unwrap_or(0);
+        let tenor_window = params.tenor_window_days.unwrap_or(200).max(30);
+        let cache = self.lake.meta_path(&format!("vol_surfaces/{symbol}.json"));
+
+        if params.refresh != Some(true) {
+            if let Ok(text) = std::fs::read_to_string(&cache) {
+                if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+                    let age_ok = value
+                        .get("calibrated_at_epoch")
+                        .and_then(Value::as_i64)
+                        .map(|epoch| Utc::now().timestamp() - epoch <= max_age)
+                        .unwrap_or(false);
+                    // Also require the request signature to match, so a stale
+                    // surface (different deal tenor / reference) is recalibrated.
+                    let signature_ok = value.get("deal_expiry").and_then(Value::as_i64).unwrap_or(0) == deal_expiry
+                        && (reference <= 0.0
+                            || value
+                                .get("reference")
+                                .and_then(Value::as_f64)
+                                .map(|cached| (cached - reference).abs() < 1e-6)
+                                .unwrap_or(false));
+                    if age_ok && signature_ok {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("cache".into(), json!("hit"));
+                        }
+                        return Ok(json_text(value));
+                    }
+                }
+            }
+        }
+
+        let value = self
+            .client
+            .data_get(
+                &format!("/v1beta1/options/snapshots/{symbol}"),
+                &[
+                    ("feed", "indicative".to_string()),
+                    ("limit", "1000".to_string()),
+                ],
+            )
+            .await?;
+
+        // Collect filtered quotes per expiry, then drop local IV outliers (the
+        // same median rule as the FinAP local fit) so SVI is not dragged up by a
+        // sawtooth smile.
+        let mut by_expiry: BTreeMap<i64, Vec<(f64, f64, bool, f64)>> = BTreeMap::new();
+        if let Some(snapshots) = value.get("snapshots").and_then(Value::as_object) {
+            for (occ, snapshot) in snapshots {
+                let Some((expiry, is_call, strike)) = parse_occ(occ) else {
+                    continue;
+                };
+                let t = (expiry - eval_serial) as f64 / 365.0;
+                if !(t > 0.0 && t <= 3.0) {
+                    continue;
+                }
+                if deal_expiry > 0 && (expiry - deal_expiry).abs() > tenor_window {
+                    continue;
+                }
+                let Some(raw_iv) = snapshot.get("impliedVolatility").and_then(Value::as_f64) else {
+                    continue;
+                };
+                let iv = if raw_iv > 3.0 { raw_iv / 100.0 } else { raw_iv };
+                if !(0.05..=0.9).contains(&iv) {
+                    continue;
+                }
+                let (Some(bp), Some(ap)) = (
+                    snapshot.pointer("/latestQuote/bp").and_then(Value::as_f64),
+                    snapshot.pointer("/latestQuote/ap").and_then(Value::as_f64),
+                ) else {
+                    continue;
+                };
+                if !(bp > 0.0 && ap > 0.0 && ap >= bp) {
+                    continue;
+                }
+                let mid = 0.5 * (bp + ap);
+                if mid <= 0.0 || (ap - bp) / mid > 0.5 {
+                    continue;
+                }
+                let weight = snapshot
+                    .pointer("/dailyBar/v")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0)
+                    .max(1.0);
+                by_expiry.entry(expiry).or_default().push((strike, iv, is_call, weight));
+            }
+        }
+        let mut quotes: Vec<vol::Quote> = Vec::new();
+        let mut strikes: Vec<f64> = Vec::new();
+        for (expiry, mut points) in by_expiry {
+            points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let count = points.len();
+            if count < 3 {
+                continue;
+            }
+            let t = (expiry - eval_serial) as f64 / 365.0;
+            for (index, (strike, iv, is_call, weight)) in points.iter().enumerate() {
+                let low = index.saturating_sub(3);
+                let high = (index + 3).min(count - 1);
+                let mut window: Vec<f64> = points[low..=high].iter().map(|point| point.1).collect();
+                window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median = window[window.len() / 2];
+                if (iv - median).abs() > (0.25 * median).max(0.08) {
+                    continue;
+                }
+                strikes.push(*strike);
+                quotes.push(vol::Quote {
+                    t,
+                    strike: *strike,
+                    iv: *iv,
+                    is_call: *is_call,
+                    weight: *weight,
+                });
+            }
+        }
+        if quotes.len() < 6 {
+            return Err(McpError::internal_error(
+                format!("insufficient clean option quotes for {symbol}"),
+                None,
+            ));
+        }
+        if reference <= 0.0 {
+            strikes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            reference = strikes[strikes.len() / 2];
+        }
+        let surface = vol::calibrate_quotes(reference, reference, &quotes);
+        let block = vol_surface_block(
+            &symbol,
+            reference,
+            eval_serial,
+            deal_expiry,
+            &surface,
+            grid_points,
+            quotes.len(),
+        );
+        if let Some(parent) = cache.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&block) {
+            let _ = std::fs::write(&cache, text);
+        }
+        let mut out = block;
+        if let Some(object) = out.as_object_mut() {
+            object.insert("cache".into(), json!("miss"));
+        }
+        Ok(json_text(out))
+    }
+
+    #[tool(description = "Vol-surface cache status for an underlying (age, SVI params, arbitrage).")]
+    async fn vol_surface_status(
+        &self,
+        Parameters(params): Parameters<VolSurfaceStatusParams>,
+    ) -> Result<String, McpError> {
+        let cache = self
+            .lake
+            .meta_path(&format!("vol_surfaces/{}.json", params.underlying.trim().to_uppercase()));
+        match std::fs::read_to_string(&cache) {
+            Ok(text) => Ok(text),
+            Err(_) => Ok(json_text(json!({"underlying": params.underlying, "cached": false}))),
+        }
     }
 
     #[tool(

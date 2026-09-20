@@ -173,6 +173,16 @@ quarterly series get `transform` + `align`; skip `regime` unless freq `D`.
 Quiet-mode semantics identical to tradeac-lake (`quiet=true` returns summaries, use when
 the goal is writing).
 
+### Rate curve for pricing (spec)
+
+The treasury tenor symbols above (`FRED_DGS3MO`…`FRED_DGS30`) are the source for a
+pricing discount curve. The **`rate_curve`** tool (spec in
+`tac-engine/skills/tac-market-data/SKILL.md`) reads the latest tenor rates and
+returns `market_data.curves[0]` — `{id, day_count, pillars: [{date, rate}]}` — for a
+fina-risk `pricing-request`. Use the tenors bracketing the deal's payment dates and
+keep the full pillar set (the engine interpolates); never collapse to a single
+pillar. Cached 10 minutes like the other market-data tools.
+
 **Secrets policy (binding):** `FRED_API_KEY` is read from the environment only — never
 hardcoded, never written to catalog/lake files, never echoed in tool output. Free FRED
 keys: https://fred.stlouisfed.org/docs/api/api_key.html. CBOE/OECD/WB need no key.
