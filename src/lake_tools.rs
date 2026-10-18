@@ -317,7 +317,7 @@ fn vol_surface_block(
 #[tool_router(router = lake_tools, vis = "pub")]
 impl TradeacServer {
     #[tool(
-        description = "Cache-first stock bars from the local parquet lake. Reads hive-partitioned bar files (market/timeframe/symbol); when lazy=true (default), missing windows are fetched from Alpaca IEX feed, persisted, and coverage/symbols/calendar metadata updated. For daily bars, Yahoo Finance is used to fill gaps before Alpaca's earliest available date. Feed defaults to iex; SIP is never used (requires license). Returns bars keyed by symbol; with quiet=true returns a per-symbol summary (count/first_t/last_t/source) instead of the bar rows."
+        description = "Cache-first stock bars from the local parquet lake. Reads hive-partitioned bar files (market/timeframe/symbol); when lazy=true (default), missing windows are fetched from Alpaca IEX feed, persisted, and coverage/symbols/calendar metadata updated. For daily bars, Yahoo Finance fills gaps before Alpaca's earliest available date; with no Alpaca credentials, Yahoo supplies daily US stock history directly. Intraday bars and non-US markets require Alpaca. Feed defaults to iex; SIP is never used (requires license). Returns bars keyed by symbol; with quiet=true returns a per-symbol summary (count/first_t/last_t/source) instead of the bar rows."
     )]
     async fn get_lake_bars(
         &self,

@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         trading = %cfg.base_url,
         data = %cfg.data_base_url,
         stream = %cfg.stream_base_url,
+        alpaca_credentials = cfg.has_credentials(),
         "starting tac-engine MCP server"
     );
 

@@ -1,9 +1,12 @@
 use rmcp::{
     ErrorData as McpError, handler::server::wrapper::Parameters, tool, tool_router,
 };
+use chrono::{Days, Utc};
+use serde_json::{Map, Value};
 
 use crate::alpaca::{is_http_error, json_text};
 use crate::fx::{self, FxClient};
+use crate::lake::{yahoo_disabled, Lake};
 use crate::market_params::{
     CorporateActionsParams, ForexLatestRatesParams, ForexRatesParams, MarketMoversParams,
     MostActivesParams, NewsParams, OptionChainParams, OptionMetaParams, OptionMultiParams,
@@ -94,6 +97,87 @@ async fn yahoo_fx_rates(
     }))
 }
 
+/// Yahoo supplies daily stock history only; keep the Alpaca response shape so
+/// existing consumers can use the same bars payload in fallback mode.
+async fn yahoo_stock_bars(
+    lake: &Lake,
+    symbols: &str,
+    timeframe: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    page_token: Option<&str>,
+) -> Result<Value, McpError> {
+    if timeframe.is_some_and(|tf| !matches!(tf.to_ascii_lowercase().as_str(), "1day" | "1d")) {
+        return Err(McpError::internal_error(
+            "Alpaca credentials are not configured; Yahoo fallback supports daily 1Day bars only",
+            None,
+        ));
+    }
+    if page_token.is_some_and(|token| !token.is_empty()) {
+        return Err(McpError::internal_error(
+            "Yahoo daily-bar fallback does not support Alpaca page tokens; request a date range instead",
+            None,
+        ));
+    }
+    if yahoo_disabled() {
+        return Err(McpError::internal_error(
+            "Yahoo fallback is disabled by TAC_YAHOO_DISABLED",
+            None,
+        ));
+    }
+
+    let symbols: Vec<String> = symbols
+        .split(',')
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect();
+    if symbols.is_empty() {
+        return Err(McpError::invalid_params("symbols is required", None));
+    }
+
+    // Alpaca's end bound is exclusive. Yahoo's daily API uses the same
+    // [start, end) convention, so only normalize the date component here.
+    let today = Utc::now().date_naive();
+    let end_date = end
+        .map(fx::date_of)
+        .transpose()?
+        .unwrap_or_else(|| today.succ_opt().unwrap_or(today));
+    let start_date = start
+        .map(fx::date_of)
+        .transpose()?
+        .unwrap_or_else(|| end_date.checked_sub_days(Days::new(365)).unwrap_or(end_date));
+
+    let mut bars_by_symbol = Map::new();
+    for symbol in symbols {
+        let bars = lake
+            .fetch_yahoo_daily_bars(&symbol, start_date, end_date)
+            .await?;
+        let rows: Vec<Value> = bars
+            .into_iter()
+            .map(|bar| {
+                serde_json::json!({
+                    "t": bar.t,
+                    "o": bar.o,
+                    "h": bar.h,
+                    "l": bar.l,
+                    "c": bar.c,
+                    "v": bar.v,
+                    "n": bar.n,
+                    "vw": bar.vw,
+                })
+            })
+            .collect();
+        bars_by_symbol.insert(symbol, Value::Array(rows));
+    }
+
+    Ok(serde_json::json!({
+        "bars": Value::Object(bars_by_symbol),
+        "next_page_token": null,
+        "source": "yahoo",
+    }))
+}
+
 #[tool_router(router = market_tools, vis = "pub")]
 impl TradeacServer {
     #[tool(description = "Get market news articles (data API). Optional symbols, start/end, limit, include_content.")]
@@ -145,11 +229,16 @@ impl TradeacServer {
         Ok(json_text(value))
     }
 
-    #[tool(description = "Latest forex rates for currency_pairs (e.g. USDJPY,EURUSD). Falls back to Yahoo/ECB free sources when Alpaca's forex API is denied (403).")]
+    #[tool(description = "Latest forex rates for currency_pairs (e.g. USDJPY,EURUSD). Uses Yahoo/ECB free sources when Alpaca credentials are absent or Alpaca denies access.")]
     async fn get_forex_latest_rates(
         &self,
         Parameters(params): Parameters<ForexLatestRatesParams>,
     ) -> Result<String, McpError> {
+        if !self.client.has_credentials() {
+            return Ok(json_text(
+                yahoo_fx_latest(&fx_pair_list(&params.currency_pairs)).await?,
+            ));
+        }
         let value = match self
             .client
             .data_get("/v1beta1/forex/latest/rates", &params.to_query())
@@ -171,11 +260,29 @@ impl TradeacServer {
         Ok(json_text(value))
     }
 
-    #[tool(description = "Historical forex rates for currency_pairs with optional timeframe/start/end. Falls back to Yahoo/ECB free sources when Alpaca's forex API is denied (403).")]
+    #[tool(description = "Historical forex rates for currency_pairs with optional timeframe/start/end. Uses daily Yahoo/ECB free sources when Alpaca credentials are absent or Alpaca denies access; intraday rates require Alpaca.")]
     async fn get_forex_rates(
         &self,
         Parameters(params): Parameters<ForexRatesParams>,
     ) -> Result<String, McpError> {
+        if !self.client.has_credentials() {
+            if params.timeframe.as_deref().is_some_and(|tf| {
+                !matches!(tf.to_ascii_lowercase().as_str(), "1day" | "1d")
+            }) {
+                return Err(McpError::internal_error(
+                    "Alpaca credentials are not configured; free FX fallback supports daily rates only",
+                    None,
+                ));
+            }
+            return Ok(json_text(
+                yahoo_fx_rates(
+                    &fx_pair_list(&params.currency_pairs),
+                    params.start.as_deref().unwrap_or(""),
+                    params.end.as_deref().unwrap_or(""),
+                )
+                .await?,
+            ));
+        }
         let value = match self
             .client
             .data_get("/v1beta1/forex/rates", &params.to_query())
@@ -203,11 +310,24 @@ impl TradeacServer {
         Ok(json_text(value))
     }
 
-    #[tool(description = "Historical stock bars for symbols (requires timeframe).")]
+    #[tool(description = "Historical stock bars for symbols. Without Alpaca credentials, daily 1Day bars use Yahoo Finance; intraday bars require Alpaca.")]
     async fn get_stock_bars(
         &self,
         Parameters(params): Parameters<StockMultiParams>,
     ) -> Result<String, McpError> {
+        if !self.client.has_credentials() {
+            return Ok(json_text(
+                yahoo_stock_bars(
+                    &self.lake,
+                    &params.symbols,
+                    params.timeframe.as_deref(),
+                    params.start.as_deref(),
+                    params.end.as_deref(),
+                    params.page_token.as_deref(),
+                )
+                .await?,
+            ));
+        }
         let value = match self
             .client
             .data_get("/v2/stocks/bars", &params.to_query())
@@ -321,11 +441,24 @@ impl TradeacServer {
         Ok(json_text(value))
     }
 
-    #[tool(description = "Historical stock bars for a single symbol (requires timeframe).")]
+    #[tool(description = "Historical stock bars for a single symbol. Without Alpaca credentials, daily 1Day bars use Yahoo Finance; intraday bars require Alpaca.")]
     async fn get_stock_bars_single(
         &self,
         Parameters(params): Parameters<StockSymbolParams>,
     ) -> Result<String, McpError> {
+        if !self.client.has_credentials() {
+            return Ok(json_text(
+                yahoo_stock_bars(
+                    &self.lake,
+                    &params.symbol,
+                    params.timeframe.as_deref(),
+                    params.start.as_deref(),
+                    params.end.as_deref(),
+                    params.page_token.as_deref(),
+                )
+                .await?,
+            ));
+        }
         let path = format!("/v2/stocks/{}/bars", params.symbol);
         let value = self.client.data_get(&path, &params.to_query()).await?;
         Ok(json_text(value))
@@ -444,6 +577,7 @@ impl TradeacServer {
         &self,
         Parameters(params): Parameters<SubscribeMarketStreamParams>,
     ) -> Result<String, McpError> {
+        self.client.require_credentials()?;
         let path = params.stream_path().map_err(|msg| {
             McpError::invalid_params(msg, None)
         })?;

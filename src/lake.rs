@@ -86,7 +86,7 @@ fn date_part(s: &str) -> Result<NaiveDate, McpError> {
 }
 
 /// Opt out of the Yahoo Finance history fallback with `TAC_YAHOO_DISABLED=1`.
-fn yahoo_disabled() -> bool {
+pub(crate) fn yahoo_disabled() -> bool {
     std::env::var("TAC_YAHOO_DISABLED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -665,7 +665,10 @@ impl Lake {
             // Coverage's feed label reflects the richest source actually used
             // across all windows (any Yahoo gap-fill => iex+yahoo), not just
             // the last window's.
-            let mut saw_iex = feed.contains("iex") || feed.contains("sip");
+            let mut saw_iex = (client.has_credentials()
+                && (feed.contains("iex") || feed.contains("sip")))
+                || (!on_disk.is_empty()
+                    && (cov.feed.contains("iex") || cov.feed.contains("sip")));
             let mut saw_yahoo = false;
             for (w_start, w_end) in &windows {
                 let (page, used_feed) = self
@@ -1833,7 +1836,7 @@ impl Lake {
     async fn fetch_bars(
         &self,
         client: &AlpacaClient,
-        _market: &str,
+        market: &str,
         symbol: &str,
         mcp_tf: &str,
         start: &str,
@@ -1841,6 +1844,26 @@ impl Lake {
         feed: &str,
         adjustment: &str,
     ) -> Result<(Vec<Bar>, String), McpError> {
+        if !client.has_credentials() {
+            if !market.eq_ignore_ascii_case("US") {
+                return Err(lake_err(
+                    "Alpaca credentials are not configured; Yahoo fallback supports US stock history only",
+                ));
+            }
+            if !mcp_tf.eq_ignore_ascii_case("1Day") {
+                return Err(lake_err(
+                    "Alpaca credentials are not configured; Yahoo fallback supports daily 1Day bars only",
+                ));
+            }
+            if yahoo_disabled() {
+                return Err(lake_err(
+                    "Alpaca credentials are not configured and Yahoo fallback is disabled by TAC_YAHOO_DISABLED",
+                ));
+            }
+            let yahoo = self.fetch_yahoo_gaps(symbol, start, end, &[]).await?;
+            return Ok((yahoo.bars, "yahoo".to_string()));
+        }
+
         let (alpaca_bars, used_feed) = match self
             .fetch_bars_with_feed(client, symbol, mcp_tf, start, end, feed, adjustment)
             .await
@@ -1959,6 +1982,20 @@ impl Lake {
             bars: all,
             first_trade_date,
         })
+    }
+
+    pub(crate) async fn fetch_yahoo_daily_bars(
+        &self,
+        symbol: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<Bar>, McpError> {
+        if yahoo_disabled() {
+            return Err(lake_err(
+                "Yahoo fallback is disabled by TAC_YAHOO_DISABLED",
+            ));
+        }
+        Ok(self.yahoo.daily_bars(symbol, start, end).await?.bars)
     }
 
     async fn fetch_bars_with_feed(

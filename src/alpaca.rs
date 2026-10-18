@@ -44,6 +44,21 @@ impl AlpacaClient {
         &self.stream_base_url
     }
 
+    pub fn has_credentials(&self) -> bool {
+        !self.api_key_id.trim().is_empty() && !self.api_secret_key.trim().is_empty()
+    }
+
+    pub fn require_credentials(&self) -> Result<(), McpError> {
+        if self.has_credentials() {
+            Ok(())
+        } else {
+            Err(McpError::internal_error(
+                "Alpaca credentials are not configured; this operation requires Alpaca. Yahoo fallback is limited to daily stock bars and daily FX rates.",
+                None,
+            ))
+        }
+    }
+
     pub async fn get(
         &self,
         path: &str,
@@ -99,6 +114,7 @@ impl AlpacaClient {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, McpError> {
+        self.require_credentials()?;
         let url = format!("{base_url}{path}");
         let mut builder = self
             .http

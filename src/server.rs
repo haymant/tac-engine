@@ -22,10 +22,16 @@ pub struct TradeacServer {
 
 impl TradeacServer {
     pub fn new(client: AlpacaClient, lake: Lake) -> Self {
+        let tool_router = if client.has_credentials() {
+            Self::trading_tools() + Self::market_tools() + Self::lake_tools()
+        } else {
+            tracing::info!("Alpaca credentials absent; account/order tools are disabled");
+            Self::market_tools() + Self::lake_tools()
+        };
         Self {
             client,
             lake,
-            tool_router: Self::trading_tools() + Self::market_tools() + Self::lake_tools(),
+            tool_router,
         }
     }
 }
@@ -274,6 +280,6 @@ impl TradeacServer {
     router = self.tool_router,
     name = "tac-engine",
     version = "0.1.0",
-    instructions = "tac-engine MCP server for Alpaca trading + market data. Trading tools mutate paper/live accounts. Market-data tools use the data API host. subscribe_market_stream briefly samples a WebSocket (most plans allow only one concurrent connection)."
+    instructions = "tac-engine MCP server. With Alpaca credentials, it provides trading, market-data, and lake tools; trading tools can mutate the configured account. Without Alpaca credentials, trading tools are omitted, daily stock history falls back to Yahoo Finance, daily FX uses free Yahoo/ECB sources, and Alpaca-only endpoints are unavailable. subscribe_market_stream requires Alpaca credentials."
 )]
 impl ServerHandler for TradeacServer {}

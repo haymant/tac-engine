@@ -36,16 +36,15 @@ compile time and not honored from the binary's install location.
 
 | Variable | Notes |
 |----------|-------|
-| `APCA_API_KEY_ID` | Alpaca API key ID (paper or live; **non-empty**). Free keys: https://alpaca.markets |
-| `APCA_API_SECRET_KEY` | Alpaca API secret (non-empty). |
 | `TAC_LAKE_DIR` | Data-lake root on the local filesystem (**mandatory, no default**). Must be an **absolute path**; `~` / `$HOME` are not expanded. Created if missing. |
 
-Missing/empty `APCA_*` or `TAC_LAKE_DIR` aborts startup with an explicit error.
+Missing/empty `TAC_LAKE_DIR` aborts startup with an explicit error. Alpaca keys are optional, but must be set as a pair when used.
 
 ### Optional
 
 | Variable | Default | Notes |
 |----------|---------|-------|
+| `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` | unset | Optional pair. Without both, daily stock history falls back to Yahoo Finance, daily FX uses free Yahoo/ECB sources, and account/order tools are omitted. Intraday bars, quotes, options, streams, and other Alpaca-only endpoints remain unavailable. |
 | `APCA_BASE_URL` | `https://paper-api.alpaca.markets` | Trading REST host. Live: `https://api.alpaca.markets`. |
 | `APCA_DATA_BASE_URL` | `https://data.alpaca.markets` | Market-data REST host. |
 | `APCA_STREAM_BASE_URL` | `wss://stream.data.alpaca.markets` | Market-data WebSocket host. |
@@ -74,8 +73,9 @@ TAC_LAKE_START_DATE=2000-01-03
 - **Data lake**: `TAC_LAKE_DIR` holds `market=*/timeframe=*/symbol=*.parquet`
   bar files plus `symbols`, `watchlist`, `calendar`, `coverage`, `features`,
   `manifest.yaml` metadata. Reads are cache-first with lazy backfill from
-  Alpaca (IEX feed; Yahoo Finance fills pre-2016/2020 gaps). One
-  feed + one adjustment per lake.
+  Alpaca (IEX feed; Yahoo Finance fills pre-2016/2020 gaps). With no Alpaca
+  keys, Yahoo supplies daily US stock history directly. One feed + one
+  adjustment per lake.
 - **Features**: TA indicators (`family=ta`), stochastic-process features
   (`family=sp`), and regime/transform features for synthetic macro symbols
   (`family=macro`) computed and persisted in the same lake.
