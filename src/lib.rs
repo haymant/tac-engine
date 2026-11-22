@@ -20,3 +20,4 @@ pub mod sp_features;
 pub mod stream;
 pub mod vol;
 pub mod yahoo;
+pub mod fixture;

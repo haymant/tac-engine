@@ -45,6 +45,7 @@ Missing/empty `TAC_LAKE_DIR` aborts startup with an explicit error. Alpaca keys 
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` | unset | Optional pair. Without both, daily stock history falls back to Yahoo Finance, daily FX uses free Yahoo/ECB sources, and account/order tools are omitted. Intraday bars, quotes, options, streams, and other Alpaca-only endpoints remain unavailable. |
+| `TAC_DRY_RUN_FIXTURE` | unset | Optional path to a JSON fixture. Exposes the named account/order/quote/news tools without credentials; `place_order` only appends an in-memory `dry_run` order and cannot contact Alpaca or mutate positions. Use only for deterministic testing. |
 | `APCA_BASE_URL` | `https://paper-api.alpaca.markets` | Trading REST host. Live: `https://api.alpaca.markets`. |
 | `APCA_DATA_BASE_URL` | `https://data.alpaca.markets` | Market-data REST host. |
 | `APCA_STREAM_BASE_URL` | `wss://stream.data.alpaca.markets` | Market-data WebSocket host. |
@@ -62,6 +63,7 @@ TAC_LAKE_DIR=/absolute/path/to/lake
 TAC_LAKE_START_DATE=2000-01-03
 # TAC_YAHOO_DISABLED=1
 # FRED_API_KEY=your-fred-key
+# TAC_DRY_RUN_FIXTURE=/absolute/path/to/fixtures/tac-dry-run.json
 ```
 
 ## What it does / architecture

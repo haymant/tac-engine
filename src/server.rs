@@ -22,10 +22,10 @@ pub struct TradeacServer {
 
 impl TradeacServer {
     pub fn new(client: AlpacaClient, lake: Lake) -> Self {
-        let tool_router = if client.has_credentials() {
+        let tool_router = if client.has_credentials() || client.dry_run() {
             Self::trading_tools() + Self::market_tools() + Self::lake_tools()
         } else {
-            tracing::info!("Alpaca credentials absent; account/order tools are disabled");
+            tracing::info!("Alpaca credentials absent and no TAC_DRY_RUN_FIXTURE; account/order tools are disabled");
             Self::market_tools() + Self::lake_tools()
         };
         Self {
@@ -280,6 +280,6 @@ impl TradeacServer {
     router = self.tool_router,
     name = "tac-engine",
     version = "0.1.0",
-    instructions = "tac-engine MCP server. With Alpaca credentials, it provides trading, market-data, and lake tools; trading tools can mutate the configured account. Without Alpaca credentials, trading tools are omitted, daily stock history falls back to Yahoo Finance, daily FX uses free Yahoo/ECB sources, and Alpaca-only endpoints are unavailable. subscribe_market_stream requires Alpaca credentials."
+    instructions = "tac-engine MCP server. With Alpaca credentials, it provides trading, market-data, and lake tools; trading tools can mutate the configured paper account. When TAC_DRY_RUN_FIXTURE is set, the same named account/order/quote/news tools are exposed against a credential-free JSON fixture: place_order only records an in-memory dry_run order and cannot contact Alpaca or mutate positions. Without credentials or a fixture, trading tools are omitted."
 )]
 impl ServerHandler for TradeacServer {}

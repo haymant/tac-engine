@@ -3,6 +3,7 @@ use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::fixture::FixtureState;
 
 #[derive(Clone)]
 pub struct AlpacaClient {
@@ -12,6 +13,7 @@ pub struct AlpacaClient {
     stream_base_url: String,
     api_key_id: String,
     api_secret_key: String,
+    fixture: Option<FixtureState>,
 }
 
 impl AlpacaClient {
@@ -29,6 +31,11 @@ impl AlpacaClient {
             stream_base_url: config.stream_base_url,
             api_key_id: config.api_key_id,
             api_secret_key: config.api_secret_key,
+            fixture: std::env::var("TAC_DRY_RUN_FIXTURE")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| FixtureState::load(std::path::Path::new(&path)))
+                .transpose()?,
         })
     }
 
@@ -46,6 +53,10 @@ impl AlpacaClient {
 
     pub fn has_credentials(&self) -> bool {
         !self.api_key_id.trim().is_empty() && !self.api_secret_key.trim().is_empty()
+    }
+
+    pub fn dry_run(&self) -> bool {
+        self.fixture.is_some()
     }
 
     pub fn require_credentials(&self) -> Result<(), McpError> {
@@ -114,6 +125,9 @@ impl AlpacaClient {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, McpError> {
+        if let Some(fixture) = &self.fixture {
+            return fixture.request(method.as_str(), path, body).await;
+        }
         self.require_credentials()?;
         let url = format!("{base_url}{path}");
         let mut builder = self
