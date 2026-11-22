@@ -58,6 +58,47 @@ impl FixtureState {
         if method == "GET" && path == "/v2/orders" {
             return fixture_value(&state, "orders");
         }
+        if method == "GET" && path == "/v2/watchlists" {
+            return fixture_value(&state, "watchlists");
+        }
+        if method == "GET" && path.starts_with("/v2/watchlists/") {
+            let watchlist_id = path.trim_start_matches("/v2/watchlists/");
+            let watchlists = state.get("watchlists").and_then(Value::as_array).cloned().unwrap_or_default();
+            return watchlists.into_iter().find(|item| item.get("id").and_then(Value::as_str) == Some(watchlist_id))
+                .ok_or_else(|| McpError::internal_error(format!("fixture watchlist not found: {watchlist_id}"), None));
+        }
+        if method == "POST" && path == "/v2/watchlists" {
+            let body = body.unwrap_or_else(|| json!({}));
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("Fixture Watchlist").to_string();
+            let id = format!("fixture-watchlist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
+            let assets = body.get("symbols").and_then(Value::as_array).cloned().unwrap_or_default()
+                .into_iter().filter_map(|symbol| symbol.as_str().map(|value| json!({ "symbol": value }))).collect::<Vec<_>>();
+            let watchlist = json!({ "id": id, "name": name, "assets": assets });
+            state["watchlists"].as_array_mut().map(|watchlists| watchlists.push(watchlist.clone()));
+            return Ok(watchlist);
+        }
+        if method == "POST" && path.starts_with("/v2/watchlists/") {
+            let watchlist_id = path.trim_start_matches("/v2/watchlists/");
+            let symbol = body.as_ref().and_then(|value| value.get("symbol")).and_then(Value::as_str).unwrap_or_default().to_string();
+            let watchlists = state["watchlists"].as_array_mut().ok_or_else(|| McpError::internal_error("fixture is missing `watchlists`", None))?;
+            let watchlist = watchlists.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(watchlist_id))
+                .ok_or_else(|| McpError::internal_error(format!("fixture watchlist not found: {watchlist_id}"), None))?;
+            watchlist["assets"].as_array_mut().map(|assets| assets.push(json!({ "symbol": symbol })));
+            return Ok(watchlist.clone());
+        }
+        if method == "DELETE" && path.starts_with("/v2/watchlists/") {
+            let suffix = path.trim_start_matches("/v2/watchlists/");
+            let mut parts = suffix.splitn(2, '/');
+            let watchlist_id = parts.next().unwrap_or_default();
+            let symbol = parts.next().unwrap_or_default().to_uppercase();
+            let watchlists = state["watchlists"].as_array_mut().ok_or_else(|| McpError::internal_error("fixture is missing `watchlists`", None))?;
+            let watchlist = watchlists.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(watchlist_id))
+                .ok_or_else(|| McpError::internal_error(format!("fixture watchlist not found: {watchlist_id}"), None))?;
+            if let Some(assets) = watchlist["assets"].as_array_mut() {
+                assets.retain(|asset| asset.get("symbol").and_then(Value::as_str).map(|value| value.to_uppercase() != symbol).unwrap_or(true));
+            }
+            return Ok(watchlist.clone());
+        }
         if method == "GET" && path.starts_with("/v2/positions/") {
             let symbol = path.trim_start_matches("/v2/positions/");
             let positions = state.get("positions").and_then(Value::as_array).cloned().unwrap_or_default();
