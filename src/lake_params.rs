@@ -9,7 +9,7 @@ pub struct LakeBarsParams {
     pub symbols: String,
     /// Lake timeframe name, e.g. `1m`, `10m`, `1h`, `1d`. Maps to Alpaca spellings.
     pub timeframe: String,
-    /// Inclusive start. `YYYY-MM-DD` or RFC-3339. Default: end minus 30 days.
+    /// Inclusive start. `YYYY-MM-DD` or RFC-3339. If omitted, uses TAC_LAKE_START_DATE (default 2000-01-03).
     pub start: Option<String>,
     /// Inclusive end. `YYYY-MM-DD` or RFC-3339. Default: now.
     pub end: Option<String>,
@@ -160,7 +160,7 @@ pub struct LakeBulkLoadParams {
     pub symbols: String,
     /// Lake timeframe name, e.g. `1d`.
     pub timeframe: String,
-    /// Inclusive start. `YYYY-MM-DD` or RFC-3339. Default: end minus 4 years.
+    /// Inclusive start. `YYYY-MM-DD` or RFC-3339. If omitted, uses TAC_LAKE_START_DATE (default 2000-01-03).
     pub start: Option<String>,
     /// Inclusive end. `YYYY-MM-DD` or RFC-3339. Default: now.
     pub end: Option<String>,

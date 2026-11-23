@@ -68,6 +68,35 @@ fn default_range(start: Option<String>, end: Option<String>) -> Result<(String, 
     Ok((start, end))
 }
 
+fn lake_bars_range(
+    start: Option<String>,
+    end: Option<String>,
+    configured_start: &str,
+) -> Result<(String, String), McpError> {
+    let end = match end {
+        Some(value) => norm_ts(&value)?,
+        None => Utc::now().to_rfc3339(),
+    };
+    let start = match start {
+        Some(value) => norm_ts(&value)?,
+        // Keep this inclusive. For daily bars the upstream provider naturally
+        // returns the next session if the date is a weekend/market holiday;
+        // the lake calendar may not exist yet on the first load.
+        None => norm_ts(configured_start)?,
+    };
+    Ok((start, end))
+}
+
+fn resolved_lake_load_start(
+    requested_start: Option<String>,
+    configured_start: &str,
+) -> Result<String, McpError> {
+    match requested_start {
+        Some(value) => norm_ts(&value),
+        None => norm_ts(configured_start),
+    }
+}
+
 fn csv_symbols(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
@@ -317,7 +346,7 @@ fn vol_surface_block(
 #[tool_router(router = lake_tools, vis = "pub")]
 impl TradeacServer {
     #[tool(
-        description = "Cache-first stock bars from the local parquet lake. Reads hive-partitioned bar files (market/timeframe/symbol); when lazy=true (default), missing windows are fetched from Alpaca IEX feed, persisted, and coverage/symbols/calendar metadata updated. For daily bars, Yahoo Finance fills gaps before Alpaca's earliest available date; with no Alpaca credentials, Yahoo supplies daily US stock history directly. Intraday bars and non-US markets require Alpaca. Feed defaults to iex; SIP is never used (requires license). Returns bars keyed by symbol; with quiet=true returns a per-symbol summary (count/first_t/last_t/source) instead of the bar rows."
+        description = "Cache-first stock bars from the local parquet lake. Reads hive-partitioned bar files (market/timeframe/symbol); when lazy=true (default), missing windows are fetched from Alpaca IEX feed, persisted, and coverage/symbols/calendar metadata updated. An omitted start uses TAC_LAKE_START_DATE (default 2000-01-03); daily providers return the first actual session on or after that inclusive date, and Yahoo Finance fills gaps before Alpaca's earliest available date. With no Alpaca credentials, Yahoo supplies daily US stock history directly. Intraday bars and non-US markets require Alpaca. Feed defaults to iex; SIP is never used (requires license). Returns bars keyed by symbol; with quiet=true returns a per-symbol summary (count/first_t/last_t/source) instead of the bar rows."
     )]
     async fn get_lake_bars(
         &self,
@@ -328,7 +357,7 @@ impl TradeacServer {
             .unwrap_or_else(|| DEFAULT_MARKET.to_string())
             .to_uppercase();
         let timeframe = lake_timeframe(&params.timeframe)?;
-        let (start, end) = default_range(params.start, params.end)?;
+        let (start, end) = lake_bars_range(params.start, params.end, &Lake::lake_start_date())?;
         let feed = params.feed.unwrap_or_else(|| DEFAULT_FEED.to_string());
         let adjustment = params
             .adjustment
@@ -682,7 +711,7 @@ impl TradeacServer {
             Some(e) => norm_ts(&e)?,
             None => Utc::now().to_rfc3339(),
         };
-        let lake_start = Lake::lake_start_date();
+        let lake_start = resolved_lake_load_start(params.start, &Lake::lake_start_date())?;
         let indicators: Vec<String> = params
             .indicators
             .unwrap_or_default()
@@ -1855,4 +1884,38 @@ fn weekday_axis(start: &str, end: &str) -> Vec<String> {
 fn date_of(ts: &str) -> chrono::NaiveDate {
     chrono::NaiveDate::parse_from_str(&ts[..10.min(ts.len())], "%Y-%m-%d")
         .unwrap_or_else(|_| Utc::now().date_naive())
+}
+
+#[cfg(test)]
+mod start_date_tests {
+    use super::{lake_bars_range, resolved_lake_load_start};
+
+    #[test]
+    fn omitted_bar_start_uses_the_configured_inclusive_date() {
+        let (start, end) = lake_bars_range(None, Some("2026-01-02".into()), "2000-01-03")
+            .expect("valid fixture dates");
+        assert_eq!(start, "2000-01-03T00:00:00+00:00");
+        assert_eq!(end, "2026-01-02T00:00:00+00:00");
+    }
+
+    #[test]
+    fn explicit_bar_start_is_preserved_instead_of_replaced_by_the_default() {
+        let (start, _end) =
+            lake_bars_range(Some("2020-01-02".into()), Some("2020-02-01".into()), "2000-01-03")
+                .expect("valid fixture dates");
+        assert_eq!(start, "2020-01-02T00:00:00+00:00");
+    }
+
+    #[test]
+    fn bulk_load_accepts_an_explicit_confirmed_recovery_start() {
+        assert_eq!(
+            resolved_lake_load_start(Some("2019-06-03".into()), "2000-01-03")
+                .expect("valid fixture date"),
+            "2019-06-03T00:00:00+00:00",
+        );
+        assert_eq!(
+            resolved_lake_load_start(None, "2000-01-03").expect("valid configured date"),
+            "2000-01-03T00:00:00+00:00",
+        );
+    }
 }
