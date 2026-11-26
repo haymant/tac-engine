@@ -16,7 +16,7 @@ use crate::lake::{DEFAULT_ADJUSTMENT, DEFAULT_FEED, DEFAULT_MARKET, Lake, lake_t
 use crate::lake_macro::{MACRO_MARKET, MACRO_TIMEFRAME};
 use crate::lake_params::{
     BackfillCalendarParams, CorrBenchmarkParams, CorrCalcParams, CorrMatrixParams,
-    CorrQueryParams, LakeBarsParams, LakeBulkLoadParams, LakeCalendarParams,
+    CorrQueryParams, IngestNarrativeParams, LakeBarsParams, LakeBulkLoadParams, LakeCalendarParams,
     LakeCoverageParams, LakeFeaturesParams, LakeFxParams, LakeFxVolParams, LakeLoadStatusParams,
     LakeRebuildParams, LakeSPParams, LakeStatusParams, LakeSymbolsParams, LakeTAParams,
     LakeValidateParams, LakeWatchlistParams, LoadLakeFxParams, MacroBarsParams,
@@ -526,7 +526,7 @@ impl TradeacServer {
     }
 
     #[tool(
-        description = "Read persisted TA features (hive-partitioned features/market=*/timeframe=*/family=ta|sp/symbol=*.parquet) with optional market/symbol/timeframe/range filters. Rows from both families (ta and sp) are merged by timestamp. With quiet=true returns a summary (row count + available feature columns) instead of the feature rows."
+        description = "Read persisted TA/SP/narr features (hive-partitioned features/market=*/timeframe=*/family=ta|sp|macro|narr/symbol=*.parquet) with optional market/symbol/timeframe/range filters. Rows from all families are merged by timestamp. With quiet=true returns a summary (row count + available feature columns) instead of the feature rows."
     )]
     async fn get_lake_features(
         &self,
@@ -939,6 +939,37 @@ impl TradeacServer {
         self.lake.ensure_macro_catalog()?;
         self.lake.upsert_macro_catalog_rows(vec![row.clone()])?;
         Ok(json_text(json!({ "upserted": row.symbol, "row": row.to_value() })))
+    }
+
+    #[tool(
+        description = "Ingest a fina-scraper narr-v1 narrative-feature export into the lake (NARRATIVE_FEATURES.md §4). Validates the staging manifest (schema narr-v1, column allowlist = the §2 columns only, no extra columns, no row t after as_of, per-file SHA-256 / row counts / column lists match the manifest) and checks each symbol against symbols.parquet (missing symbols are recorded there and listed as new_symbols). Then atomically merges each file into features/market=US/timeframe=<tf>/family=narr/symbol=<SYM>.parquet (upsert by t, never rewrites history, never deletes rows) and updates coverage.parquet for the narr family. Returns {ingest_id, symbols, new_symbols, rows_ingested, rows_skipped, columns, coverage, dry_run}. On ANY validation failure ingests NOTHING and the error names the exact failing check. tac_lake_dir, when given, must equal the server's configured TAC_LAKE_DIR (host-resolved, never an arbitrary caller path). With dry_run=true validates only and ingests nothing."
+    )]
+    async fn ingest_narrative_features(
+        &self,
+        Parameters(params): Parameters<IngestNarrativeParams>,
+    ) -> Result<String, McpError> {
+        if let Some(dir) = params.tac_lake_dir.as_deref() {
+            let given = std::fs::canonicalize(dir).map_err(|e| {
+                McpError::invalid_params(format!("tac_lake_dir cannot be resolved: {e}"), None)
+            })?;
+            if given != self.lake.dir {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "tac_lake_dir {} does not match the server's configured TAC_LAKE_DIR {}; the lake dir is host-resolved, never caller-supplied as an arbitrary path",
+                        given.display(),
+                        self.lake.dir.display()
+                    ),
+                    None,
+                ));
+            }
+        }
+        let mut result = self
+            .lake
+            .ingest_narrative_features(std::path::Path::new(&params.manifest_path), params.dry_run.unwrap_or(false))?;
+        if let (Some(rid), Some(obj)) = (params.request_id, result.as_object_mut()) {
+            obj.insert("request_id".to_string(), json!(rid));
+        }
+        Ok(json_text(result))
     }
 
     #[tool(
@@ -1698,6 +1729,13 @@ impl TradeacServer {
             for row in syms {
                 if stock.len() >= n_stock {
                     break;
+                }
+                // Coverage now carries one row per family; only bar rows
+                // identify stock legs (a narr row must not duplicate a leg).
+                if let Some(f) = row.get("family").and_then(Value::as_str) {
+                    if f != "bars" {
+                        continue;
+                    }
                 }
                 if let Some(s) = row.get("symbol").and_then(Value::as_str) {
                     stock.push((DEFAULT_MARKET.to_string(), s.to_string()));

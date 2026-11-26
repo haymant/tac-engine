@@ -8,6 +8,7 @@ use duckdb::types::{TimeUnit, Value as DbValue, ValueRef};
 use duckdb::{Connection, params_from_iter};
 use rmcp::ErrorData as McpError;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::alpaca::{AlpacaClient, is_http_error, is_http_error_in};
 use crate::query::push_opt;
@@ -20,12 +21,44 @@ pub const DEFAULT_MARKET: &str = "US";
 pub const DEFAULT_FEED: &str = "iex";
 pub const DEFAULT_ADJUSTMENT: &str = "raw";
 
+/// Feature family written by `ingest_narrative_features` (NARRATIVE_FEATURES.md §2/§4).
+pub const NARR_FAMILY: &str = "narr";
+
+/// Manifest schema accepted by `ingest_narrative_features`.
+pub const NARR_SCHEMA: &str = "narr-v1";
+
+/// `narr-v1` column allowlist (NARRATIVE_FEATURES.md §2): the `t` bucket
+/// timestamp plus the twelve table columns and `narr_coverage_24h` (named in
+/// §2's gap rule). No other column may be ingested.
+pub const NARRATIVE_COLUMNS: &[&str] = &[
+    "t",
+    "narr_sent_mean_24h",
+    "narr_sent_z_30d",
+    "narr_sent_trend_24h",
+    "narr_sent_momentum_24h",
+    "narr_mentions_24h",
+    "narr_burst_ratio",
+    "narr_distinct_sources_24h",
+    "narr_claim_count_24h",
+    "narr_corroborated_24h",
+    "narr_verified_share_24h",
+    "narr_novelty_24h",
+    "narr_price_return_24h",
+    "narr_coverage_24h",
+];
+
 pub(crate) fn lake_err(msg: impl Display) -> McpError {
     McpError::internal_error(format!("lake error: {msg}"), None)
 }
 
 fn sq(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -357,18 +390,30 @@ impl Lake {
 
     // ---- coverage ---------------------------------------------------------
 
+    /// Bar coverage for one symbol. Coverage rows are keyed by
+    /// `(market, timeframe, symbol, family)`; rows written before the
+    /// `family` column existed carry no family and are treated as bars.
+    /// Use [`Self::set_family_coverage`] for non-bar families (e.g. `narr`).
     pub fn get_coverage(&self, market: &str, timeframe: &str, symbol: &str) -> Result<Coverage, McpError> {
         let path = self.meta_path("coverage");
         if !path.exists() {
             return Ok(Coverage::default());
         }
         let sql = format!(
-            "SELECT first_t, last_t, num_bars, feed, adjustment FROM read_parquet('{}') WHERE market = ? AND timeframe = ? AND symbol = ? LIMIT 1",
+            "SELECT * FROM read_parquet('{}') WHERE market = ? AND timeframe = ? AND symbol = ?",
             sq(&path.to_string_lossy())
         );
         let args = vec![market.to_string(), timeframe.to_string(), symbol.to_string()];
         let rows = self.query_json(&sql, &args)?;
-        let row = rows.into_iter().next().unwrap_or_default();
+        let row = rows
+            .into_iter()
+            .find(|r| {
+                r.get("family")
+                    .and_then(Value::as_str)
+                    .map(|f| f == "bars")
+                    .unwrap_or(true)
+            })
+            .unwrap_or_default();
         Ok(Coverage {
             first_t: row.get("first_t").and_then(Value::as_str).map(String::from),
             last_t: row.get("last_t").and_then(Value::as_str).map(String::from),
@@ -402,20 +447,34 @@ impl Lake {
     }
 
     pub(crate) fn set_coverage(&self, market: &str, timeframe: &str, symbol: &str, cov: &Coverage) -> Result<(), McpError> {
+        self.set_family_coverage(market, timeframe, symbol, "bars", cov)
+    }
+
+    /// Upsert one coverage row for `(market, timeframe, symbol, family)`.
+    /// Rows written before the `family` column existed are treated as
+    /// `family="bars"` when re-read, so bar coverage survives the upgrade.
+    /// `num_bars` is the row count of the family's partition for the symbol
+    /// (bars for `bars`, feature rows for `narr`, ...).
+    pub(crate) fn set_family_coverage(&self, market: &str, timeframe: &str, symbol: &str, family: &str, cov: &Coverage) -> Result<(), McpError> {
         let existing = self.read_coverage(None, None, None)?;
-        let mut by_key: BTreeMap<(String, String, String), Value> = BTreeMap::new();
+        let mut by_key: BTreeMap<(String, String, String, String), Value> = BTreeMap::new();
         for row in existing {
             let key = (
                 row.get("market").and_then(Value::as_str).unwrap_or_default().to_string(),
                 row.get("timeframe").and_then(Value::as_str).unwrap_or_default().to_string(),
                 row.get("symbol").and_then(Value::as_str).unwrap_or_default().to_string(),
+                row.get("family")
+                    .and_then(Value::as_str)
+                    .unwrap_or("bars")
+                    .to_string(),
             );
             by_key.insert(key, row);
         }
-        let key = (market.to_string(), timeframe.to_string(), symbol.to_string());
+        let key = (market.to_string(), timeframe.to_string(), symbol.to_string(), family.to_string());
         let mut row = by_key.remove(&key).unwrap_or_else(|| {
-            json!({ "market": market, "timeframe": timeframe, "symbol": symbol })
+            json!({ "market": market, "timeframe": timeframe, "symbol": symbol, "family": family })
         });
+        row["family"] = Value::String(family.to_string());
         if let (Some(f), Some(cf)) = (cov.first_t.as_deref(), row.get("first_t").and_then(Value::as_str)) {
             if f < cf {
                 row["first_t"] = Value::String(f.to_string());
@@ -449,6 +508,7 @@ impl Lake {
                     m.get("market").cloned().unwrap_or(Value::Null),
                     m.get("timeframe").cloned().unwrap_or(Value::Null),
                     m.get("symbol").cloned().unwrap_or(Value::Null),
+                    m.get("family").cloned().unwrap_or(Value::String("bars".to_string())),
                     m.get("first_t").cloned().unwrap_or(Value::Null),
                     m.get("last_t").cloned().unwrap_or(Value::Null),
                     m.get("num_bars").cloned().unwrap_or(Value::Null),
@@ -461,8 +521,8 @@ impl Lake {
             .collect();
         self.table_write(
             "coverage",
-            "(market VARCHAR, timeframe VARCHAR, symbol VARCHAR, first_t TIMESTAMP, last_t TIMESTAMP, num_bars BIGINT, feed VARCHAR, adjustment VARCHAR, loaded_at TIMESTAMP, updated_at TIMESTAMP)",
-            "INSERT INTO coverage VALUES (CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))",
+            "(market VARCHAR, timeframe VARCHAR, symbol VARCHAR, family VARCHAR, first_t TIMESTAMP, last_t TIMESTAMP, num_bars BIGINT, feed VARCHAR, adjustment VARCHAR, loaded_at TIMESTAMP, updated_at TIMESTAMP)",
+            "INSERT INTO coverage VALUES (CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS BIGINT), CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))",
             &rows,
         )
     }
@@ -1821,6 +1881,467 @@ impl Lake {
         conn.execute_batch(&copy).map_err(lake_err)?;
         fs::rename(&tmp, &path).map_err(|e| lake_err(format!("rename feature: {e}")))?;
         Ok(())
+    }
+
+    // ---- narrative features (narr-v1) ------------------------------------
+
+    /// Validate a fina-scraper `narr-v1` staging manifest and merge its
+    /// files into the `family=narr` partitions
+    /// (`features/market=US/timeframe=<tf>/family=narr/symbol=<SYM>.parquet`).
+    ///
+    /// Validation (NARRATIVE_FEATURES.md §4) runs in full before any write:
+    /// schema must be `narr-v1`, columns must be exactly the §2 allowlist
+    /// (no extras), every row's `t` must be `<= as_of` (anti-look-ahead),
+    /// per-file SHA-256 / row counts / column lists must match the manifest,
+    /// and staging files must live under the manifest directory. On ANY
+    /// failure nothing is ingested and the error names the failing check.
+    ///
+    /// The merge is an upsert by `t` (new rows win on duplicate `t`, history
+    /// is never rewritten or deleted). Symbols missing from
+    /// `symbols.parquet` are recorded there and listed in `new_symbols`.
+    /// Coverage is updated per symbol for the `narr` family. With
+    /// `dry_run`, validation and the merge plan run but nothing is written.
+    pub fn ingest_narrative_features(&self, manifest_path: &Path, dry_run: bool) -> Result<Value, McpError> {
+        let fail = |check: String| {
+            McpError::invalid_params(format!("narrative ingest validation failed: {check}"), None)
+        };
+        let manifest_canon = fs::canonicalize(manifest_path)
+            .map_err(|e| fail(format!("cannot read manifest {}: {e}", manifest_path.display())))?;
+        let manifest_dir = manifest_canon
+            .parent()
+            .ok_or_else(|| fail("manifest has no parent directory".to_string()))?
+            .to_path_buf();
+        let manifest_bytes = fs::read(&manifest_canon)
+            .map_err(|e| fail(format!("cannot read manifest {}: {e}", manifest_canon.display())))?;
+        let manifest: Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| fail(format!("manifest is not valid JSON: {e}")))?;
+
+        let schema = manifest.get("schema").and_then(Value::as_str).unwrap_or_default();
+        if schema != NARR_SCHEMA {
+            return Err(fail(format!("schema: expected '{NARR_SCHEMA}', got '{schema}'")));
+        }
+        let as_of_raw = manifest
+            .get("as_of")
+            .and_then(Value::as_str)
+            .ok_or_else(|| fail("manifest is missing 'as_of'".to_string()))?;
+        let as_of = norm_ts(as_of_raw).map_err(|e| fail(format!("as_of: {}", e.message)))?;
+        let as_of_dt = DateTime::parse_from_rfc3339(&as_of)
+            .map_err(|e| fail(format!("as_of is not RFC-3339: {e}")))?
+            .with_timezone(&Utc);
+        let timeframe_raw = manifest
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .ok_or_else(|| fail("manifest is missing 'timeframe'".to_string()))?;
+        let timeframe = lake_timeframe(timeframe_raw)
+            .map_err(|e| fail(format!("timeframe: {}", e.message)))?;
+        let tier = manifest
+            .get("tier")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let files = manifest
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| fail("manifest is missing 'files'".to_string()))?;
+        if files.is_empty() {
+            return Err(fail("manifest 'files' is empty".to_string()));
+        }
+        let manifest_symbols: Vec<String> = manifest
+            .get("symbols")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // ---- per-file validation (all of it, before any write) -------------
+        struct ValidatedFile {
+            symbol: String,
+            path: PathBuf,
+            columns: Vec<String>,
+            rows: Vec<Value>,
+        }
+        let mut validated: Vec<ValidatedFile> = Vec::new();
+        let mut file_symbols: Vec<String> = Vec::new();
+        for entry in files {
+            let symbol = entry
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_uppercase();
+            if symbol.is_empty()
+                || !symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+            {
+                return Err(fail(format!("bad symbol in manifest files entry: '{symbol}'")));
+            }
+            file_symbols.push(symbol.clone());
+            let raw_path = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| fail(format!("manifest file entry for {symbol} is missing 'path'")))?;
+            let joined = if Path::new(raw_path).is_absolute() {
+                PathBuf::from(raw_path)
+            } else {
+                manifest_dir.join(raw_path)
+            };
+            let canon = fs::canonicalize(&joined).map_err(|_| {
+                fail(format!("staging file for {symbol} not found: {raw_path}"))
+            })?;
+            if !canon.starts_with(&manifest_dir) {
+                return Err(fail(format!(
+                    "staging file for {symbol} is outside the manifest directory: {}",
+                    canon.display()
+                )));
+            }
+            if let Some(expected_sha) = entry.get("sha256").and_then(Value::as_str) {
+                let bytes = fs::read(&canon).map_err(|e| {
+                    fail(format!("cannot read staging file for {symbol}: {e}"))
+                })?;
+                let actual = sha256_hex(&bytes);
+                if actual != expected_sha {
+                    return Err(fail(format!(
+                        "sha256 mismatch for {symbol}: manifest {expected_sha}, file {actual}"
+                    )));
+                }
+            }
+            // Schema: exactly the narr-v1 allowlist, no extra columns.
+            // Staging files live under hive dirs (market=/timeframe=/family=/
+            // symbol=), so hive_partitioning must be off or DuckDB would
+            // inject those partition columns into the schema/rows.
+            let describe_sql = format!(
+                "DESCRIBE SELECT * FROM read_parquet('{}', hive_partitioning=false)",
+                sq(&canon.to_string_lossy())
+            );
+            let described = self.query_json(&describe_sql, &[]).map_err(|e| {
+                fail(format!("cannot read parquet schema for {symbol}: {}", e.message))
+            })?;
+            let mut columns: Vec<String> = described
+                .iter()
+                .filter_map(|r| r.get("column_name").and_then(Value::as_str).map(String::from))
+                .collect();
+            if !columns.contains(&"t".to_string()) {
+                return Err(fail(format!("{symbol} file has no 't' column")));
+            }
+            for c in &columns {
+                if !NARRATIVE_COLUMNS.contains(&c.as_str()) {
+                    return Err(fail(format!(
+                        "extra column '{c}' in {symbol} file (allowlist: narr-v1 §2 columns only)"
+                    )));
+                }
+            }
+            if let Some(manifest_cols) = entry.get("columns").and_then(Value::as_array) {
+                let mut listed: Vec<String> = manifest_cols
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                listed.sort();
+                let mut actual_sorted = columns.clone();
+                actual_sorted.sort();
+                if listed != actual_sorted {
+                    return Err(fail(format!(
+                        "manifest columns for {symbol} do not match the parquet file: manifest {:?}, file {:?}",
+                        listed, actual_sorted
+                    )));
+                }
+            }
+            columns.sort();
+            // Rows: anti-look-ahead + no duplicate t.
+            let rows_sql = format!(
+                "SELECT * FROM read_parquet('{}', hive_partitioning=false) ORDER BY t",
+                sq(&canon.to_string_lossy())
+            );
+            let rows = self.query_json(&rows_sql, &[]).map_err(|e| {
+                fail(format!("cannot read parquet rows for {symbol}: {}", e.message))
+            })?;
+            if let Some(expected_rows) = entry.get("rows").and_then(Value::as_i64)
+                && rows.len() as i64 != expected_rows
+            {
+                return Err(fail(format!(
+                    "row count mismatch for {symbol}: manifest {expected_rows}, file {}",
+                    rows.len()
+                )));
+            }
+            let mut seen_t: Vec<i64> = Vec::new();
+            for row in &rows {
+                let t = row
+                    .get("t")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| fail(format!("row in {symbol} file has no 't'")))?;
+                let dt = DateTime::parse_from_rfc3339(t)
+                    .map_err(|_| fail(format!("row t '{t}' in {symbol} file is not RFC-3339")))?
+                    .with_timezone(&Utc);
+                if dt > as_of_dt {
+                    return Err(fail(format!(
+                        "row t {t} for {symbol} is after as_of {as_of}"
+                    )));
+                }
+                let micros = dt.timestamp_micros();
+                if seen_t.contains(&micros) {
+                    return Err(fail(format!("duplicate t {t} in {symbol} file")));
+                }
+                seen_t.push(micros);
+            }
+            validated.push(ValidatedFile {
+                symbol,
+                path: canon,
+                columns,
+                rows,
+            });
+        }
+        let mut manifest_sorted = manifest_symbols.clone();
+        manifest_sorted.sort();
+        let mut files_sorted = file_symbols.clone();
+        files_sorted.sort();
+        if manifest_sorted != files_sorted {
+            return Err(fail(format!(
+                "manifest 'symbols' {manifest_sorted:?} do not match 'files' symbols {files_sorted:?}"
+            )));
+        }
+
+        // ---- symbol check: record new symbols explicitly -------------------
+        let known: Vec<String> = self
+            .read_symbols()?
+            .iter()
+            .filter_map(|r| r.get("symbol").and_then(Value::as_str).map(|s| s.to_uppercase()))
+            .collect();
+        let new_symbols: Vec<String> = file_symbols
+            .iter()
+            .filter(|s| !known.contains(s))
+            .cloned()
+            .collect();
+
+        // ---- merge plan per symbol (upsert by t) ---------------------------
+        struct MergePlan {
+            symbol: String,
+            staging: PathBuf,
+            columns: Vec<String>,
+            merged_first_t: Option<String>,
+            merged_last_t: Option<String>,
+            merged_rows: usize,
+        }
+        let mut plans: Vec<MergePlan> = Vec::new();
+        let mut total_ingested = 0usize;
+        let mut total_skipped = 0usize;
+        for vf in &validated {
+            let target = self.family_path(DEFAULT_MARKET, &timeframe, &vf.symbol, NARR_FAMILY);
+            let mut existing_by_t: BTreeMap<i64, Value> = BTreeMap::new();
+            if target.exists() {
+                let describe_sql = format!(
+                    "DESCRIBE SELECT * FROM read_parquet('{}', hive_partitioning=false)",
+                    sq(&target.to_string_lossy())
+                );
+                let described = self.query_json(&describe_sql, &[])?;
+                let mut cols: Vec<String> = described
+                    .iter()
+                    .filter_map(|r| r.get("column_name").and_then(Value::as_str).map(String::from))
+                    .collect();
+                cols.sort();
+                if cols != vf.columns {
+                    return Err(fail(format!(
+                        "existing family=narr file for {} has columns {:?} which differ from the manifest columns {:?}",
+                        vf.symbol, cols, vf.columns
+                    )));
+                }
+                let rows_sql = format!(
+                    "SELECT * FROM read_parquet('{}', hive_partitioning=false) ORDER BY t",
+                    sq(&target.to_string_lossy())
+                );
+                for row in self.query_json(&rows_sql, &[])? {
+                    if let Some(t) = row.get("t").and_then(Value::as_str)
+                        && let Ok(dt) = DateTime::parse_from_rfc3339(t)
+                    {
+                        existing_by_t.insert(dt.with_timezone(&Utc).timestamp_micros(), row);
+                    }
+                }
+            }
+            let mut ingested = 0usize;
+            let mut skipped = 0usize;
+            let mut merged_t: Vec<i64> = existing_by_t.keys().copied().collect();
+            // Compare rows with `t` normalised to micros-precision RFC-3339:
+            // the stored row's `t` comes back with a `.000000` suffix while
+            // a text-typed staging row has none, so a raw Value equality
+            // would count an identical re-ingest as changed (F7-3).
+            let norm_row = |r: &Value| {
+                let mut c = r.clone();
+                if let Some(t) = c.get("t").and_then(Value::as_str).map(String::from)
+                    && let Ok(dt) = DateTime::parse_from_rfc3339(&t)
+                {
+                    c["t"] = json!(dt
+                        .with_timezone(&Utc)
+                        .to_rfc3339_opts(SecondsFormat::Micros, true));
+                }
+                c
+            };
+            for row in &vf.rows {
+                let t = row.get("t").and_then(Value::as_str).unwrap_or_default();
+                let micros = DateTime::parse_from_rfc3339(t)
+                    .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
+                    .unwrap_or(0);
+                match existing_by_t.get(&micros) {
+                    Some(old) if norm_row(old) == norm_row(row) => skipped += 1,
+                    _ => {
+                        ingested += 1;
+                        if !merged_t.contains(&micros) {
+                            merged_t.push(micros);
+                        }
+                    }
+                }
+            }
+            merged_t.sort();
+            let fmt_t = |micros: i64| {
+                DateTime::<Utc>::from_timestamp_micros(micros)
+                    .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
+            };
+            total_ingested += ingested;
+            total_skipped += skipped;
+            plans.push(MergePlan {
+                symbol: vf.symbol.clone(),
+                staging: vf.path.clone(),
+                columns: vf.columns.clone(),
+                merged_first_t: merged_t.first().and_then(|m| fmt_t(*m)),
+                merged_last_t: merged_t.last().and_then(|m| fmt_t(*m)),
+                merged_rows: merged_t.len(),
+            });
+        }
+
+        let ingest_id = format!(
+            "ingest-{}-{}",
+            Utc::now().format("%Y%m%d-%H%M%S"),
+            &sha256_hex(&manifest_bytes)[..8]
+        );
+        let coverage_json: Vec<Value> = plans
+            .iter()
+            .map(|p| {
+                json!({
+                    "symbol": p.symbol,
+                    "family": NARR_FAMILY,
+                    "market": DEFAULT_MARKET,
+                    "timeframe": timeframe,
+                    "first_t": p.merged_first_t,
+                    "last_t": p.merged_last_t,
+                    "rows": p.merged_rows,
+                })
+            })
+            .collect();
+        let all_columns: Vec<String> = {
+            let mut cols: Vec<String> = validated
+                .iter()
+                .flat_map(|vf| vf.columns.clone())
+                .collect();
+            cols.sort();
+            cols.dedup();
+            cols
+        };
+        let result = json!({
+            "ingest_id": ingest_id,
+            "manifest_path": manifest_canon.to_string_lossy(),
+            "schema": NARR_SCHEMA,
+            "tier": tier,
+            "as_of": as_of,
+            "timeframe": timeframe,
+            "symbols": file_symbols,
+            "new_symbols": new_symbols,
+            "rows_ingested": total_ingested,
+            "rows_skipped": total_skipped,
+            "columns": all_columns,
+            "coverage": coverage_json,
+            "dry_run": dry_run,
+        });
+        if dry_run {
+            return Ok(result);
+        }
+
+        // ---- write phase: stage every merge to a tmp file first, then commit
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for plan in &plans {
+            let target = self.family_path(DEFAULT_MARKET, &timeframe, &plan.symbol, NARR_FAMILY);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| lake_err(format!("create feature dir: {e}")))?;
+            }
+            let cols_sql = plan
+                .columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The narr-v1 staging file carries `t` as RFC-3339 text
+            // (fina-scraper export); the lake convention is timestamp[us]
+            // (bars/ta/sp). Cast on the way in so the stored partition
+            // matches the other families: tac-qlib `load_features` merges
+            // families on `t` and pandas refuses to merge datetime64
+            // against str (final e2e 2026-11-26: rd_validate_workflow
+            // failed exactly on that merge). The old-target branch below
+            // self-heals a pre-fix string-typed partition the same way
+            // (VARCHAR vs TIMESTAMP comparison coerces; UNION ALL unifies
+            // to TIMESTAMP).
+            let cols_sql_in = plan
+                .columns
+                .iter()
+                .map(|c| {
+                    if c == "t" {
+                        "CAST(\"t\" AS TIMESTAMP) AS \"t\"".to_string()
+                    } else {
+                        format!("\"{c}\"")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tmp = target.with_extension("parquet.tmp");
+            let conn = self.conn()?;
+            conn.execute_batch(
+                &format!(
+                    "CREATE OR REPLACE TABLE __narr_in AS SELECT {cols_sql_in} FROM read_parquet('{}', hive_partitioning=false);",
+                    sq(&plan.staging.to_string_lossy())
+                ),
+            )
+            .map_err(lake_err)?;
+            if target.exists() {
+                conn.execute_batch(
+                    &format!(
+                        "CREATE OR REPLACE TABLE __narr_out AS SELECT {cols_sql} FROM read_parquet('{}', hive_partitioning=false) WHERE t NOT IN (SELECT t FROM __narr_in) UNION ALL SELECT {cols_sql} FROM __narr_in;",
+                        sq(&target.to_string_lossy())
+                    ),
+                )
+                .map_err(lake_err)?;
+            } else {
+                conn.execute_batch("CREATE OR REPLACE TABLE __narr_out AS SELECT * FROM __narr_in;")
+                    .map_err(lake_err)?;
+            }
+            conn.execute_batch(
+                &format!(
+                    "COPY (SELECT {cols_sql} FROM __narr_out ORDER BY t) TO '{}' (FORMAT PARQUET);",
+                    sq(&tmp.to_string_lossy())
+                ),
+            )
+            .map_err(lake_err)?;
+            staged.push((tmp, target));
+        }
+        for (tmp, target) in &staged {
+            fs::rename(tmp, target).map_err(|e| lake_err(format!("rename narr feature: {e}")))?;
+        }
+        if !new_symbols.is_empty() {
+            self.touch_symbols(DEFAULT_MARKET, &timeframe, &new_symbols)?;
+        }
+        for plan in &plans {
+            self.set_family_coverage(
+                DEFAULT_MARKET,
+                &timeframe,
+                &plan.symbol,
+                NARR_FAMILY,
+                &Coverage {
+                    first_t: plan.merged_first_t.clone(),
+                    last_t: plan.merged_last_t.clone(),
+                    num_bars: plan.merged_rows as i64,
+                    feed: "narrative".to_string(),
+                    adjustment: NARR_SCHEMA.to_string(),
+                },
+            )?;
+        }
+        Ok(result)
     }
 
     // ---- network: Alpaca + Yahoo fallback -----------------------------------
@@ -3339,6 +3860,310 @@ mod tests {
         assert!(!has_misalign, "healthy symbol should not report misalignment: {issues2:?}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- narrative ingest (narr-v1) --------------------------------------
+
+    /// Write one staging parquet file for a symbol under `root` (TAC-layout
+    /// staging path) and return `(path, columns, sha256)`. Each row is
+    /// `(t, narr_sent_mean_24h, narr_mentions_24h)`; every other narr-v1
+    /// column is NULL except `narr_burst_ratio` (1.0) and
+    /// `narr_coverage_24h` (1). With `extra_col`, an off-allowlist column
+    /// is added so the validation failure can be exercised. With `t_text`,
+    /// `t` is written as VARCHAR (the real fina-scraper export shape)
+    /// instead of TIMESTAMP, so the ingest cast can be exercised.
+    fn narr_write_staging(
+        lake: &Lake,
+        root: &Path,
+        symbol: &str,
+        rows: &[(&str, f64, i64)],
+        extra_col: bool,
+        t_text: bool,
+    ) -> (PathBuf, Vec<String>, String) {
+        let path = root
+            .join("market=US")
+            .join("timeframe=1d")
+            .join("family=narr")
+            .join(format!("symbol={symbol}.parquet"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let extra_ddl = if extra_col { ", narr_evil DOUBLE" } else { "" };
+        let extra_val = if extra_col { ", 1.0" } else { "" };
+        let t_ddl = if t_text { "VARCHAR" } else { "TIMESTAMP" };
+        let conn = lake.conn().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE __narr_stg(t {t_ddl}, narr_sent_mean_24h DOUBLE, narr_sent_z_30d DOUBLE, narr_sent_trend_24h DOUBLE, narr_sent_momentum_24h DOUBLE, narr_mentions_24h BIGINT, narr_burst_ratio DOUBLE, narr_distinct_sources_24h BIGINT, narr_claim_count_24h BIGINT, narr_corroborated_24h BIGINT, narr_verified_share_24h DOUBLE, narr_novelty_24h DOUBLE, narr_price_return_24h DOUBLE, narr_coverage_24h BIGINT{extra_ddl});"
+        ))
+        .unwrap();
+        for (t, sent, mentions) in rows {
+            conn.execute_batch(&format!(
+                "INSERT INTO __narr_stg VALUES ('{t}', {sent}, NULL, NULL, NULL, {mentions}, 1.0, 1, 1, 0, NULL, NULL, NULL, 1{extra_val});"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(&format!(
+            "COPY __narr_stg TO '{}' (FORMAT PARQUET);",
+            sq(&path.to_string_lossy())
+        ))
+        .unwrap();
+        let mut columns: Vec<String> = NARRATIVE_COLUMNS.iter().map(|s| s.to_string()).collect();
+        if extra_col {
+            columns.push("narr_evil".to_string());
+        }
+        columns.sort();
+        let sha = sha256_hex(&fs::read(&path).unwrap());
+        (path, columns, sha)
+    }
+
+    /// Write a narr-v1 manifest for `entries`:
+    /// `(symbol, staging path, rows, columns, sha256)`.
+    fn narr_write_manifest(
+        root: &Path,
+        schema: &str,
+        as_of: &str,
+        entries: &[(&str, &Path, i64, &[String], &str)],
+    ) -> PathBuf {
+        let files: Vec<Value> = entries
+            .iter()
+            .map(|(sym, path, rows, cols, sha)| {
+                json!({
+                    "symbol": sym,
+                    "path": path.to_string_lossy(),
+                    "rows": rows,
+                    "columns": cols,
+                    "sha256": sha,
+                })
+            })
+            .collect();
+        let symbols: Vec<String> = entries.iter().map(|(s, _, _, _, _)| s.to_string()).collect();
+        let manifest = json!({
+            "schema": schema,
+            "as_of": as_of,
+            "start": "2026-11-22",
+            "end": "2026-11-24",
+            "timeframe": "1d",
+            "tier": "tier2_llm",
+            "symbols": symbols,
+            "files": files,
+        });
+        let path = root.join("manifest.json");
+        fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        path
+    }
+
+    fn narr_rows() -> Vec<(&'static str, f64, i64)> {
+        vec![
+            ("2026-11-22T00:00:00+00:00", 0.5, 3),
+            ("2026-11-23T00:00:00+00:00", -0.2, 5),
+            ("2026-11-24T00:00:00+00:00", 0.1, 2),
+        ]
+    }
+
+    #[test]
+    fn narr_ingest_dry_run_real_and_reingest() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let (path, cols, sha) = narr_write_staging(&lake, &stage_dir, "NVDA", &narr_rows(), false, false);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 3, &cols, &sha)],
+        );
+
+        // Dry run: validates, reports the plan, writes nothing.
+        let dry = lake.ingest_narrative_features(&manifest, true).unwrap();
+        assert_eq!(dry.get("dry_run"), Some(&json!(true)));
+        assert_eq!(dry.get("rows_ingested"), Some(&json!(3)));
+        assert_eq!(dry.get("rows_skipped"), Some(&json!(0)));
+        assert_eq!(dry.get("new_symbols"), Some(&json!(["NVDA"])));
+        assert!(!lake.family_path("US", "1d", "NVDA", "narr").exists());
+        assert!(!lake.meta_path("coverage").exists());
+        assert!(lake.read_symbols().unwrap().is_empty());
+
+        // Real ingest: lands the partition, coverage (narr family) and symbols.
+        let res = lake.ingest_narrative_features(&manifest, false).unwrap();
+        assert_eq!(res.get("dry_run"), Some(&json!(false)));
+        assert_eq!(res.get("rows_ingested"), Some(&json!(3)));
+        assert!(lake.family_path("US", "1d", "NVDA", "narr").exists());
+        let feats = lake.read_features(Some("US"), Some("NVDA"), Some("1d"), None, None).unwrap();
+        assert_eq!(feats.len(), 3);
+        assert_eq!(feats[0].get("narr_sent_mean_24h").and_then(Value::as_f64), Some(0.5));
+        assert_eq!(feats[0].get("narr_mentions_24h").and_then(Value::as_i64), Some(3));
+        let cov = lake.read_coverage(None, None, None).unwrap();
+        assert_eq!(cov.len(), 1);
+        assert_eq!(cov[0].get("family").and_then(Value::as_str), Some("narr"));
+        assert_eq!(cov[0].get("num_bars").and_then(Value::as_i64), Some(3));
+        // Bar coverage is untouched: no bars row exists for NVDA.
+        assert_eq!(lake.get_coverage("US", "1d", "NVDA").unwrap().num_bars, 0);
+        let syms = lake.read_symbols().unwrap();
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].get("symbol").and_then(Value::as_str), Some("NVDA"));
+
+        // Re-ingest of the identical manifest: everything skipped, no dupes.
+        let again = lake.ingest_narrative_features(&manifest, false).unwrap();
+        assert_eq!(again.get("rows_ingested"), Some(&json!(0)));
+        assert_eq!(again.get("rows_skipped"), Some(&json!(3)));
+        assert_eq!(again.get("new_symbols"), Some(&json!([])));
+        let feats = lake.read_features(Some("US"), Some("NVDA"), Some("1d"), None, None).unwrap();
+        assert_eq!(feats.len(), 3, "re-ingest must not duplicate rows");
+
+        // Upsert: one changed value + one new day. History is kept (4 rows),
+        // the changed row carries the new value.
+        let mut rows2 = narr_rows();
+        rows2[1].1 = 0.9;
+        rows2.push(("2026-11-25T00:00:00+00:00", 0.3, 7));
+        // as_of must cover the new row for this second export.
+        let (path2, cols2, sha2) = narr_write_staging(&lake, &stage_dir, "NVDA", &rows2, false, false);
+        let manifest2 = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-25T16:00:00+00:00",
+            &[("NVDA", &path2, 4, &cols2, &sha2)],
+        );
+        let up = lake.ingest_narrative_features(&manifest2, false).unwrap();
+        assert_eq!(up.get("rows_ingested"), Some(&json!(2)));
+        assert_eq!(up.get("rows_skipped"), Some(&json!(2)));
+        let feats = lake.read_features(Some("US"), Some("NVDA"), Some("1d"), None, None).unwrap();
+        assert_eq!(feats.len(), 4);
+        assert_eq!(feats[1].get("narr_sent_mean_24h").and_then(Value::as_f64), Some(0.9));
+        assert_eq!(feats[3].get("narr_mentions_24h").and_then(Value::as_i64), Some(7));
+
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    /// F7-3 (final e2e 2026-11-26): the real fina-scraper export writes `t`
+    /// as VARCHAR text, while the lake convention is timestamp[us]. Ingest
+    /// must cast on the way in, or tac-qlib `load_features` fails merging
+    /// families on `t` (pandas: "merge on datetime64[us] and str columns").
+    /// Also proves re-ingest still dedups over a TIMESTAMP-typed target.
+    #[test]
+    fn narr_ingest_casts_string_t_to_timestamp() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_textt_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_textt_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let (path, cols, sha) =
+            narr_write_staging(&lake, &stage_dir, "NVDA", &narr_rows(), false, true);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 3, &cols, &sha)],
+        );
+        let res = lake.ingest_narrative_features(&manifest, false).unwrap();
+        assert_eq!(res.get("rows_ingested"), Some(&json!(3)));
+        let target = lake.family_path("US", "1d", "NVDA", "narr");
+        let described = lake
+            .query_json(
+                &format!(
+                    "DESCRIBE SELECT * FROM read_parquet('{}', hive_partitioning=false)",
+                    sq(&target.to_string_lossy())
+                ),
+                &[],
+            )
+            .unwrap();
+        let t_col = described
+            .iter()
+            .find(|r| r.get("column_name").and_then(Value::as_str) == Some("t"))
+            .expect("t column in landed narr partition");
+        assert_eq!(
+            t_col.get("column_type").and_then(Value::as_str),
+            Some("TIMESTAMP"),
+            "landed narr t must be TIMESTAMP, got {t_col:?}"
+        );
+        // Re-ingest over the TIMESTAMP-typed target: all skipped, no dupes.
+        let again = lake.ingest_narrative_features(&manifest, false).unwrap();
+        assert_eq!(again.get("rows_ingested"), Some(&json!(0)));
+        assert_eq!(again.get("rows_skipped"), Some(&json!(3)));
+        let feats = lake.read_features(Some("US"), Some("NVDA"), Some("1d"), None, None).unwrap();
+        assert_eq!(feats.len(), 3);
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn narr_ingest_rejects_bad_schema() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_schema_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_schema_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let (path, cols, sha) = narr_write_staging(&lake, &stage_dir, "NVDA", &narr_rows(), false, false);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v2",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 3, &cols, &sha)],
+        );
+        let err = lake.ingest_narrative_features(&manifest, false).unwrap_err();
+        assert!(err.message.contains("schema"), "expected schema check, got {}", err.message);
+        assert!(!lake.family_path("US", "1d", "NVDA", "narr").exists(), "failed ingest must write nothing");
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn narr_ingest_rejects_extra_column() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_extra_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_extra_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let (path, cols, sha) = narr_write_staging(&lake, &stage_dir, "NVDA", &narr_rows(), true, false);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 3, &cols, &sha)],
+        );
+        let err = lake.ingest_narrative_features(&manifest, false).unwrap_err();
+        assert!(err.message.contains("extra column 'narr_evil'"), "expected extra-column check, got {}", err.message);
+        assert!(!lake.family_path("US", "1d", "NVDA", "narr").exists());
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn narr_ingest_rejects_future_t() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_future_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_future_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let mut rows = narr_rows();
+        rows.push(("2026-11-25T00:00:00+00:00", 0.4, 1));
+        let (path, cols, sha) = narr_write_staging(&lake, &stage_dir, "NVDA", &rows, false, false);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 4, &cols, &sha)],
+        );
+        let err = lake.ingest_narrative_features(&manifest, false).unwrap_err();
+        assert!(err.message.contains("after as_of"), "expected look-ahead check, got {}", err.message);
+        assert!(!lake.family_path("US", "1d", "NVDA", "narr").exists());
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn narr_ingest_rejects_sha_mismatch() {
+        let pid = std::process::id();
+        let lake_dir = std::env::temp_dir().join(format!("taclake_narr_sha_{pid}"));
+        let stage_dir = std::env::temp_dir().join(format!("taclake_narr_stage_sha_{pid}"));
+        let lake = Lake::new(lake_dir.clone()).unwrap();
+        let (path, cols, _sha) = narr_write_staging(&lake, &stage_dir, "NVDA", &narr_rows(), false, false);
+        let manifest = narr_write_manifest(
+            &stage_dir,
+            "narr-v1",
+            "2026-11-24T16:00:00+00:00",
+            &[("NVDA", &path, 3, &cols, "deadbeef")],
+        );
+        let err = lake.ingest_narrative_features(&manifest, false).unwrap_err();
+        assert!(err.message.contains("sha256 mismatch"), "expected sha check, got {}", err.message);
+        assert!(!lake.family_path("US", "1d", "NVDA", "narr").exists());
+        let _ = fs::remove_dir_all(&lake_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
     }
 }
 

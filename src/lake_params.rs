@@ -194,6 +194,25 @@ pub struct LakeValidateParams {
     pub end: Option<String>,
 }
 
+/// Ingest a fina-scraper `narr-v1` narrative-feature export into the lake
+/// (see NARRATIVE_FEATURES.md §4). Validates the whole manifest before
+/// writing anything; on any validation failure nothing is ingested and the
+/// error names the exact failing check.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct IngestNarrativeParams {
+    /// Path to the staging manifest.json produced by fina-scraper
+    /// `export_symbol_features` (e.g. `$NIP_LAKE_DIR/_exports/narrative-features/manifest.json`).
+    pub manifest_path: String,
+    /// Optional lake dir. When given it must equal the server's configured
+    /// `TAC_LAKE_DIR`; the lake dir is host-resolved, never caller-supplied
+    /// as an arbitrary path. Omit to use the configured lake.
+    pub tac_lake_dir: Option<String>,
+    /// If true, validate only and ingest nothing.
+    pub dry_run: Option<bool>,
+    /// Caller-supplied correlation id, echoed in the response.
+    pub request_id: Option<String>,
+}
+
 // ---- macro (synthetic symbols, market=MACRO) --------------------------------
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
